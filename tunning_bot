@@ -1,0 +1,281 @@
+#!/usr/bin/env python
+# encoding: utf8
+
+import difflib
+import hmac
+import json
+import numpy
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+
+def dict_factory(cursor, row):
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
+
+class ProfileMgr:
+    conn = None
+    def __init__(self):
+        self.conn = sqlite3.connect('tunning_bot.db')
+        self.conn.row_factory
+        c = self.conn.cursor()
+        c.execute('''SELECT name FROM sqlite_master WHERE type='table' ''')
+        res = c.fetchone()
+
+        if res is None or "profile_history" not in res:
+            print( "Creating table 'profile_history'..." )
+            c.execute('''CREATE TABLE profile_history( profile_id INTEGER PRIMARY KEY, profile_data text, profile_time int)''')
+
+    def list(self,limit=None):
+        self.conn.row_factory = dict_factory
+
+        limit_str = ""
+        if limit is not None:
+            limit_str = "LIMIT {}".format( int(limit) )
+
+        c = self.conn.cursor()
+        qry = '''SELECT * FROM profile_history ORDER BY profile_time DESC {} '''.format( limit_str )
+        res = c.execute( qry )
+        result = res.fetchall()
+        return result
+
+    def get(self, profile_id):
+        c = self.conn.cursor()
+        qry = '''SELECT * FROM profile_history WHERE profile_id = {} '''.format( profile_id )
+        res = c.execute( qry )
+        result = res.fetchone()
+        return result
+
+    def add(self, time, data):
+        c = self.conn.cursor()
+        qry = '''INSERT INTO profile_history (`profile_time`, `profile_data`) VALUES ( {}, '{}' )'''.format(time, data)
+        res = c.execute(qry)
+        res = self.conn.commit()
+        return res
+
+    def delete(self, profile_id):
+        c = self.conn.cursor()
+        res = c.execute('''DELETE FROM profile_history WHERE profile_id = {} '''.format( profile_id ))
+        return res
+
+    def edit(self,profile_id, time, data):
+        c = self.conn.cursor()
+        res = c.execute('''UPDATE profile_history SET profile_time={}, profile_data="{}" WHERE profile_id = {} '''.format( profile_time, profile_data, profile_id ) )
+        return res
+
+    def get_last_config(self):
+        result = None
+        profiles = self.list(1)
+        if len(profiles) > 0:
+            result = profiles[0]
+
+        return result
+
+    def grab_live_config(self):
+        result = {}
+
+        targets = []
+        targets.append( "net.ipv4.tcp_low_latency" )
+        targets.append( "net.ipv4.tcp_fastopen" )
+
+        for i in range(0, len(targets) ):
+            itm = targets[i]
+
+            cmd = "/usr/sbin/sysctl --values {}".format( itm )
+            (out, err) = subprocess.Popen([ cmd ], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE ).communicate()
+
+            # convert bytes to str in python3
+            out, err = map(lambda s: s.decode(errors='replace').strip(), (out, err))
+
+            result[ itm ] = out.strip()
+
+        # Sort here for furture diff compare
+        return json.dumps(result,sort_keys=True)
+
+    def check_and_record(self):
+        curr_timestamp = int(time.time())
+        curr_cfg = self.grab_live_config()
+
+        last_cfg = self.get_last_config()
+        if last_cfg is None or len(last_cfg) == 0 :
+          print( "Profile history is empty, add new record right now...")
+          res = self.add( curr_timestamp, curr_cfg )
+          return 1
+
+        if not hmac.compare_digest(last_cfg["profile_data"], curr_cfg):
+          print( "Profile change detected. Add new profile history...")
+          res = self.add( curr_timestamp, curr_cfg )
+          return 2
+
+        return 0
+
+    def measure_profile(self, profile_id, interval_sec = 10 ):
+        # get profile
+        profile = self.get( profile_id )
+
+        time_beg = profile["profile_time"]
+        time_end = profile["profile_time"] + interval_sec
+
+        qry = "SELECT mean(\\\"response\\\") FROM \\\"latency\\\" WHERE {}s <= time AND time <= {}s".format( time_beg, time_end )
+        cmd = """curl -G 'http://localhost:8086/query?pretty=true&epoch=ms' --data-urlencode "db=telegraf" --data-urlencode "q={}" """.format( qry )
+        (out, err) = subprocess.Popen([ cmd ], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE ).communicate()
+
+        # convert bytes to str in python3
+        out, err = map(lambda s: s.decode(errors='replace').strip(), (out, err))
+        data_obj = json.loads( out )
+        val = ( data_obj["results"][0]["series"][0]["values"][0][1] )
+
+        profile["val"] = val
+
+        return profile
+
+    def compare_profile( self, profile_befr_id, profile_aftr_id=None ):
+
+        # if profile_aftr is None, pick last profile
+        if profile_aftr_id is None:
+            profile_aftr_id = self.get_last_config()["profile_id"]
+
+        # find profile_data measurements
+        stat_befr = self.measure_profile( profile_befr_id )
+        stat_aftr = self.measure_profile( profile_aftr_id )
+
+        # calc measurement delta
+        val_befr = stat_befr["val"]
+        val_aftr = stat_aftr["val"]
+        val_delta = val_aftr - val_befr
+
+        t_befr = stat_befr["profile_time"]
+        t_aftr = stat_aftr["profile_time"]
+
+        cfg_befr = json.dumps( json.loads(stat_befr["profile_data"]) , indent=True )
+        cfg_aftr = json.dumps( json.loads(stat_aftr["profile_data"]) , indent=True )
+
+        diff = difflib.unified_diff( cfg_befr.splitlines(keepends=True), cfg_aftr.splitlines(keepends=True), fromfile="before "+str(t_befr), tofile="after "+str(t_aftr) )
+        diff_text = "".join(diff)
+
+        result = { "delta": val_delta, "diff": diff_text }
+
+        return result
+
+    def prepare_data_for_machine_learning(self, limit=None):
+        data = self.list(limit)
+
+        matrix_input = []
+        matrix_output = []
+
+        for i in range( len(data) ):
+            input_ary = []
+            output_ary = []
+            itm = data[i]
+            pf_id = itm["profile_id"]
+            pf_data = json.loads( itm["profile_data"] )
+            for key in sorted(pf_data.keys()):
+                cfg_val = float( pf_data[key] )
+                input_ary.append( cfg_val )
+
+            pf_metric = self.measure_profile( pf_id )["val"]
+            output_ary.append(pf_metric)
+
+            matrix_input.append( input_ary )
+            matrix_output.append( output_ary )
+
+        return { "input": matrix_input, "output":matrix_output }
+
+
+# Ref: https://iamtrask.github.io/2015/07/27/python-network-part2/
+class MachineLearning:
+    alphas = [0.1,1,10]
+    hiddenSize = 30
+
+    def __init__(self):
+        return
+
+    # compute sigmoid nonlinearity
+    def sigmoid(self, x):
+        output = 1/(1+numpy.exp(-x))
+        return output
+
+    # convert output of sigmoid function to its derivative
+    def sigmoid_output_to_derivative(self, output):
+        return output*(1-output)
+
+    def process_data(self, data):
+        result = None
+
+        input_matrix = data["input"]
+        output_matrix = data["output"]
+
+        X = numpy.array(input_matrix)
+        y = numpy.array(output_matrix)
+        dim_X = len( X[0] )
+        dim_y = len( y[0] )
+
+        for alpha in self.alphas:
+            print( "\nTraining With Alpha:" + str(alpha) )
+            numpy.random.seed(1)
+
+            # randomly initialize our weights with mean 0
+            synapse_0 = 2*numpy.random.random((dim_X,self.hiddenSize)) - 1
+            synapse_1 = 2*numpy.random.random((self.hiddenSize,dim_y)) - 1
+
+            for j in range(60000):
+
+                # Feed forward through layers 0, 1, and 2
+                layer_0 = X
+                layer_1 = self.sigmoid(numpy.dot(layer_0,synapse_0))
+                layer_2 = self.sigmoid(numpy.dot(layer_1,synapse_1))
+
+                # how much did we miss the target value?
+                layer_2_error = layer_2 - y
+
+                if (j% 10000) == 0:
+                    print( "Error after "+str(j)+" iterations:" + str(numpy.mean(numpy.abs(layer_2_error))) )
+
+                # in what direction is the target value?
+                # were we really sure? if so, don't change too much.
+                layer_2_delta = layer_2_error*self.sigmoid_output_to_derivative(layer_2)
+
+                # how much did each l1 value contribute to the l2 error (according to the weights)?
+                layer_1_error = layer_2_delta.dot(synapse_1.T)
+
+                # in what direction is the target l1?
+                # were we really sure? if so, don't change too much.
+                layer_1_delta = layer_1_error * self.sigmoid_output_to_derivative(layer_1)
+
+                synapse_1 -= alpha * (layer_1.T.dot(layer_2_delta))
+                synapse_0 -= alpha * (layer_0.T.dot(layer_1_delta))
+
+        return result
+
+def main():
+  # sys.argv
+
+  pMgr = ProfileMgr()
+  ret = pMgr.check_and_record()
+
+  # Compare profile
+  if ret == 0:
+    last_two = pMgr.list(2)
+    if len( last_two ) == 2:
+      pf1 = last_two[0]["profile_id"]
+      pf2 = last_two[1]["profile_id"]
+
+      compare_result = pMgr.compare_profile( pf2, pf1 )
+      print( "delta:\n" , compare_result["delta"], "\n" )
+      print( "diff:", "\n"+compare_result["diff"] )
+
+  # Enter machine learning
+  data = pMgr.prepare_data_for_machine_learning()
+  pML = MachineLearning()
+  data_calc = pML.process_data( data )
+  # Not implemented yet
+  #  cfg_predict = pML.predict( data, data_calc )
+  #  pMgr.make_change( cfg_predict )
+
+if __name__ == "__main__":
+    main()
